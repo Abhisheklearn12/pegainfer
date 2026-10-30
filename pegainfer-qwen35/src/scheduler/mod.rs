@@ -734,7 +734,7 @@ fn prefill_step_chunk(
     };
     debug_assert!(stride > 0 && chunk > 0 && cursor + chunk <= prompt_len);
     let end = cursor + chunk;
-    let last_stop = history_tokens.map_or(prompt_len, |h| h.min(prompt_len)) / stride * stride;
+    let last_stop = crate::prefix_cache::history_stop(prompt_len, history_tokens, stride);
     if cursor < last_stop && last_stop < end {
         return last_stop - cursor;
     }

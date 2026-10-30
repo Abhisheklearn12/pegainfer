@@ -197,7 +197,17 @@ fn assert_trace_exact(label: &str, cold: &Generation, warm: &Generation) {
         cold.tokens, warm.tokens,
         "{label}: generated token trace changed"
     );
-    assert_eq!(cold.logprobs.len(), warm.logprobs.len());
+    // Missing logprobs on both sides would compare equal, so require one per token.
+    for (side, trace) in [("cold", cold), ("warm", warm)] {
+        assert_eq!(
+            trace.logprobs.len(),
+            trace.tokens.len(),
+            "{label}: {side} trace needs one logprob per token"
+        );
+        if let Some(i) = trace.logprobs.iter().position(Option::is_none) {
+            panic!("{label}: {side} position {i} has no logprob");
+        }
+    }
     let diverged = cold
         .logprobs
         .iter()
@@ -343,7 +353,7 @@ fn cold_output_ignores_cache_budget() {
     assert_trace_exact("cache off vs 512 MiB", &cache_off, &cold(512));
 }
 
-/// A hit on another prompt's stop replays the cold run exactly when the cuts match;
+/// A hit on another prompt's stop replays the cold run exactly when its cut history matches;
 /// when the hit moves a cut, greedy tokens hold and no logprob moves further than a
 /// cut change moves it between cold runs.
 #[test]
@@ -444,6 +454,38 @@ fn next_turn_resumes_at_history_boundary() {
         ),
         3072
     );
+}
+
+/// A warm hinted turn must not resume past its history stop, even when a longer
+/// snapshot of the same tokens exists, or the next turn loses that boundary.
+#[test]
+fn warm_hinted_turn_still_stops_at_history_boundary() {
+    let Some(model_path) = model_path_or_skip() else {
+        return;
+    };
+    let tokenizer = common::load_tokenizer(&model_path);
+    let mut handle = start_engine(&model_path, 1, PREFIX_CACHE_MIB);
+    let turn = prompt_tokens(
+        &tokenizer,
+        "A warm chat turn first arrives without the frontend's history hint. ",
+        4100,
+    );
+    // Unhinted, the turn's step ends include 3072 and 4096 but not 3840.
+    assert_eq!(generate(&mut handle, turn.clone(), 1, 0).cached_tokens, 0);
+    let mut hinted = request(turn.clone(), 1, 0);
+    hinted.history_tokens = Some(4094);
+    assert_eq!(
+        run(&mut handle, hinted).cached_tokens,
+        3072,
+        "a hinted lookup must not resume past its 3840 stop"
+    );
+    let mut next_turn = turn[..4094].to_vec();
+    next_turn.extend(prompt_tokens(
+        &tokenizer,
+        "The user follows up with another question. ",
+        200,
+    ));
+    assert_eq!(generate(&mut handle, next_turn, 1, 0).cached_tokens, 3840);
 }
 
 fn restore_during_live_decode(

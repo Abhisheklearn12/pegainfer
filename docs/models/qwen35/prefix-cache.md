@@ -94,12 +94,12 @@ SNAPSHOT_STRIDE_TOKENS = 256
 The stride is a multiple of the 16-token KV block size, so every snapshot key references the lineage hash of a complete registered KV block. With the cache on, the scheduler (`prefill_step_chunk`) cuts prefill only where the budget and the prompt put a step end (#1077):
 
 - every step uses its full budget, and an unfinished step's end rounds down to a 256-token boundary;
-- one extra stop lands on the last boundary at or below the request's `history_tokens` (the prompt length when it has none), so the next chat turn resumes near where this one ended and never inside the generation prompt;
+- one extra stop lands on the last boundary at or below the request's `history_tokens` (the prompt length when it has none), so the next chat turn resumes near where this one ended and never inside the generation prompt; lookup never resumes a request past that stop, so a warm hinted turn still computes it;
 - a budget share that cannot reach the next boundary runs unaligned, without a snapshot, rather than stall.
 
-At the default 1,024-token budget a 4,160-token prompt runs `1024 -> 2048 -> 3072 -> 4096 -> 4160`, the same five forwards as with the cache off; a 4,000-token prompt adds its stop: `1024 -> 2048 -> 3072 -> 3840 -> 4000`. Cold cuts depend only on the budget, the prompt and `history_tokens`, never on cache size or slot pressure, so a hit at one of the request's own step ends replays its cold cuts exactly. Which snapshot a request resumes from still depends on cache size and LRU, and its later cuts start there, so a hit off its own step ends can move logprobs as far as a cut change does. The cost is coverage: a shared prefix that ends between two step ends reuses up to one step less than a snapshot every 256 tokens would. vLLM's `mamba_cache_mode="align"` makes the same trade, and vLLM has removed its every-block `"all"` mode.
+At the default 1,024-token budget a 4,160-token prompt runs `1024 -> 2048 -> 3072 -> 4096 -> 4160`, the same five forwards as with the cache off; a 4,000-token prompt adds its stop: `1024 -> 2048 -> 3072 -> 3840 -> 4000`. Cold cuts depend only on the budget, the prompt and `history_tokens`, never on cache size or slot pressure. A snapshot key records the tokens and the boundary, not the cuts that produced it, so a hit reproduces the request's cold output exactly only when the snapshot's whole cut history matches the request's cold cuts. Which snapshot a request resumes from depends on cache size and LRU, and a hit whose history differs can move logprobs as far as a cut change does, even at one of the request's own step ends: a probe that resumed at 3840 and then published 4096 hands later hits at 4096 a 3840 cut their cold run never made. The cost is coverage: a shared prefix that ends between two step ends reuses up to one step less than a snapshot every 256 tokens would. vLLM's `mamba_cache_mode="align"` makes the same trade, and vLLM has removed its every-block `"all"` mode.
 
-Moving a cut moves numerics. Measured on main for #1077 (Qwen3.5-4B, sm_89, 32 greedy tokens), cold runs of one prompt that differ only in cuts (cache on vs off, budgets 512/1024/8192) keep identical tokens but differ by mean 0.11-0.25 and p99 0.6-2.4 in top logprobs, while runs with the same cuts match exactly. In an early experiment (not every shape or path), splitting only the projection GEMMs into 256-token calls removed the difference, pointing to the GEMM shape. Same-cut restores, including a cross-prompt hit whose cuts match, are therefore checked for exact equality. A hit that moves a cut must keep greedy tokens, and no top logprob may move further (p99) than between cold runs that differ only in cuts in the same test; means are not bounded because they count how many logprobs shift by one bf16 step and vary about 2x between cut changes (Qwen3.5-2B on an RTX 3060: cut-change means 0.023-0.043, moved-cut hit 0.048, all p99 at or below 0.25).
+Moving a cut moves numerics. Measured on main for #1077 (Qwen3.5-4B, sm_89, 32 greedy tokens), cold runs of one prompt that differ only in cuts (cache on vs off, budgets 512/1024/8192) keep identical tokens but differ by mean 0.11-0.25 and p99 0.6-2.4 in top logprobs, while runs with the same cuts match exactly. In an early experiment (not every shape or path), splitting only the projection GEMMs into 256-token calls removed the difference, pointing to the GEMM shape. Restores whose whole cut history matches, including a cross-prompt one, are therefore checked for exact equality. A hit that moves a cut must keep greedy tokens, and no top logprob may move further (p99) than between cold runs that differ only in cuts in the same test; means are not bounded because they count how many logprobs shift by one bf16 step and move between cut changes and between processes, which time their own decode GEMMs (Qwen3.5-2B on an RTX 3060, two runs: cut-change means 0.023-0.070, moved-cut hit 0.048 and 0.057, all p99 at or below 0.25).
 
 The GDR implementation internally tiles work in 64-token chunks, but this is not a snapshot correctness constraint. It handles a partial final tile and applies recurrent state for arbitrary positive sequence lengths. The invariant is “after a successful whole-model window,” not `position % 64 == 0`.
 
@@ -215,7 +215,7 @@ let cached_tokens = prefix_cache.finish_restore(
 `begin_request` performs the logical lookup and KV attach:
 
 1. Probe the longest registered KV prefix while keeping candidate blocks alive.
-2. Enumerate eligible 256-token boundaries from longest to shortest, leaving at least one prompt token to run.
+2. Enumerate eligible 256-token boundaries from longest to shortest, leaving at least one prompt token to run and none past the request's history stop.
 3. Build `PrefixBoundaryKey` from the canonical `SequenceHash` and token position.
 4. Pin the corresponding snapshot slot.
 5. Select the first boundary with both resources; if none exists, return `0` without changing request state.
@@ -265,7 +265,7 @@ This keeps admission, attachment, and eviction deterministic across ranks while 
 - A prefix hit always leaves at least one prompt token uncached so final prefill can emit the first generated token.
 - Echo requests are rejected before prefix matching.
 - Cold prefill cuts depend only on the step budget, the prompt and `history_tokens`, never on cache size or slot pressure.
-- Allocation pressure changes which snapshot a request resumes from: a hit at one of the request's own step ends keeps its cold output exactly, and a hit off them can move logprobs as far as a cut change does.
+- Allocation pressure changes which snapshot a request resumes from. A hit keeps the request's cold output exactly only when the snapshot's whole cut history matches the request's cold cuts (its key records tokens and boundary, not cuts); otherwise logprobs can move as far as a cut change does.
 - Failed forward or snapshot insertion never publishes a cache key.
 - A KV-only or snapshot-only boundary is never reported as cached tokens.
 - A snapshot may outlive its KV blocks; lookup treats missing KV as a cache miss.
@@ -285,7 +285,7 @@ The implementation acceptance surface should include:
 
 - cache-management tests for snapshot keys, shorter-boundary fallback, duplicate insertion, pinning, and unpinned eviction;
 - scheduler tests for prompts below 256, exactly on boundaries, across multiple boundaries, and with non-aligned tails;
-- step-end cuts: cold output identical across cache sizes, exact same-cut restores (also across prompts), a moved-cut hit within a measured cut-change floor, and the `history_tokens` stop;
+- step-end cuts: cold output identical across cache sizes, exact same-cut restores (also across prompts), a moved-cut hit within a measured cut-change floor, and the `history_tokens` stop, also when the hinted turn starts warm;
 - availability tests for KV-only, snapshot-only, and shorter valid fallback;
 - adapter salt isolation;
 - mixed cold and warm requests in the same prefill/unified step;
